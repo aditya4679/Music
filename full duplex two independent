@@ -10,50 +10,74 @@
 
 #define FIFO1 "/tmp/fifo1"   // Process1 → Process2
 #define FIFO2 "/tmp/fifo2"   // Process2 → Process1
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096      // enough size for multi‑line input
 
 void analyze(const char *s, int *chars, int *words, int *lines) {
-    *chars = strlen(s);
-    *lines = 1;
+    *chars = 0;
     *words = 0;
+    *lines = 0;
+
     int inWord = 0;
+    int lineHasContent = 0;
+
     for (int i = 0; s[i] != '\0'; i++) {
-        if (s[i] == '\n') (*lines)++;
-        if (isspace((unsigned char)s[i])) {
-            inWord = 0;
-        } else {
+        char c = s[i];
+        // count characters except newline
+        if (c != '\n') {
+            (*chars)++;
+        }
+        // detect word boundaries
+        if (!isspace((unsigned char)c) && c != '\n') {
+            lineHasContent = 1;
             if (!inWord) {
                 inWord = 1;
                 (*words)++;
             }
+        } else {
+            inWord = 0;
         }
+        // when you hit newline, if the line had content, count it
+        if (c == '\n') {
+            if (lineHasContent) {
+                (*lines)++;
+            }
+            lineHasContent = 0;
+        }
+    }
+    // if last line didn't end in newline but had content
+    if (lineHasContent) {
+        (*lines)++;
     }
 }
 
 int main(void) {
     pid_t pid1, pid2;
 
-    // Create FIFOs
+    // Create FIFOs (ignore error if they already exist)
     mkfifo(FIFO1, 0666);
     mkfifo(FIFO2, 0666);
 
-    // Fork Process2 (reader‑analyzer)
+    // Fork Process2 (analyzer)
     pid2 = fork();
     if (pid2 < 0) {
         perror("fork");
         exit(EXIT_FAILURE);
     }
     if (pid2 == 0) {
-        // child acting as Process2
+        // Child: Process2 – reads from FIFO1, analyzes, writes to FIFO2
         char sentence[BUFFER_SIZE];
         while (1) {
             int fd1 = open(FIFO1, O_RDONLY);
-            if (fd1 < 0) { perror("open FIFO1"); exit(EXIT_FAILURE); }
-            if (read(fd1, sentence, BUFFER_SIZE) <= 0) {
-                close(fd1);
+            if (fd1 < 0) {
+                perror("open FIFO1");
+                exit(EXIT_FAILURE);
+            }
+            ssize_t r = read(fd1, sentence, BUFFER_SIZE - 1);
+            close(fd1);
+            if (r <= 0) {
                 continue;
             }
-            close(fd1);
+            sentence[r] = '\0';
 
             if (strcmp(sentence, "exit") == 0) {
                 break;
@@ -64,33 +88,58 @@ int main(void) {
 
             char out[BUFFER_SIZE];
             snprintf(out, BUFFER_SIZE,
-                     "Input: %s\nCharacters: %d\nWords: %d\nLines: %d",
+                     "Input:\n%s\nCharacters: %d\nWords: %d\nLines: %d",
                      sentence, chars, words, lines);
 
             int fd2 = open(FIFO2, O_WRONLY);
-            if (fd2 < 0) { perror("open FIFO2"); exit(EXIT_FAILURE); }
+            if (fd2 < 0) {
+                perror("open FIFO2");
+                exit(EXIT_FAILURE);
+            }
             write(fd2, out, strlen(out) + 1);
             close(fd2);
         }
         exit(EXIT_SUCCESS);
     }
 
-    // Fork Process1 (sentence‑writer)
+    // Fork Process1 (user interface)
     pid1 = fork();
     if (pid1 < 0) {
         perror("fork");
         exit(EXIT_FAILURE);
     }
     if (pid1 == 0) {
-        // child acting as Process1
+        // Child: Process1 – reads user input, sends to Process2, receives result
         char sentence[BUFFER_SIZE];
         while (1) {
-            printf("Enter sentence (or \"exit\" to quit): ");
-            if (!fgets(sentence, BUFFER_SIZE, stdin)) break;
-            sentence[strcspn(sentence, "\n")] = '\0';
+            printf("Enter text (blank line to finish input, or \"exit\" alone to quit):\n");
+            sentence[0] = '\0';
+
+            while (1) {
+                char line[BUFFER_SIZE];
+                if (!fgets(line, BUFFER_SIZE, stdin)) {
+                    break;
+                }
+                line[strcspn(line, "\n")] = '\0';
+
+                if (strcmp(line, "exit") == 0 && sentence[0] == '\0') {
+                    strcpy(sentence, "exit");
+                    break;
+                }
+                if (line[0] == '\0') {
+                    // blank line → end of multi‑line input
+                    break;
+                }
+
+                strncat(sentence, line, sizeof(sentence) - strlen(sentence) - 1);
+                strncat(sentence, "\n", sizeof(sentence) - strlen(sentence) - 1);
+            }
 
             int fd1w = open(FIFO1, O_WRONLY);
-            if (fd1w < 0) { perror("open FIFO1 write"); exit(EXIT_FAILURE); }
+            if (fd1w < 0) {
+                perror("open FIFO1 write");
+                exit(EXIT_FAILURE);
+            }
             write(fd1w, sentence, strlen(sentence) + 1);
             close(fd1w);
 
@@ -99,24 +148,29 @@ int main(void) {
             }
 
             int fd2r = open(FIFO2, O_RDONLY);
-            if (fd2r < 0) { perror("open FIFO2 read"); exit(EXIT_FAILURE); }
+            if (fd2r < 0) {
+                perror("open FIFO2 read");
+                exit(EXIT_FAILURE);
+            }
             char result[BUFFER_SIZE];
-            read(fd2r, result, BUFFER_SIZE);
+            ssize_t rr = read(fd2r, result, BUFFER_SIZE - 1);
             close(fd2r);
-
-            printf("Result from Process2:\n%s\n\n", result);
+            if (rr > 0) {
+                result[rr] = '\0';
+                printf("Result from Process2:\n%s\n\n", result);
+            }
         }
         exit(EXIT_SUCCESS);
     }
 
-    // Parent waits for both children
+    // Parent process: wait for child processes and cleanup FIFOs
     wait(NULL);
     wait(NULL);
 
-    // Cleanup FIFOs
     unlink(FIFO1);
     unlink(FIFO2);
 
     printf("Main: Both processes finished. Exiting.\n");
     return EXIT_SUCCESS;
 }
+
